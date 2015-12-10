@@ -1,72 +1,126 @@
 import mongo_connection
 import praw
-import unicodedata
+import sys
+from prawoauth2 import PrawOAuth2Mini
+from tokens import app_key, app_secret, access_token, refresh_token
+from settings import user_agent, scopes
+import datetime
+import querygen
 
 __author__ = 'Fabian'
+today = datetime.date.today()
+then = datetime.date(2015, 12, 1)
+subreddits = ["movie", "movies", "film", "oscars", "comingsoon"]
+reddit_client = praw.Reddit(user_agent=user_agent)
+oauth_helper = PrawOAuth2Mini(reddit_client, app_key=app_key,
+                              app_secret=app_secret, access_token=access_token,
+                              scopes=scopes, refresh_token=refresh_token)
 
 
-def crawl_movies(subreddits, queries, subreddit_start=0, queries_start=0):
-    subreddits = list(enumerate(subreddits))
-    queries = list(enumerate(queries))
-    db = mongo_connection.MongoConnection().get_db()
-    redditApi = praw.Reddit(user_agent='server:coins2015oscar2.redditmoviecrawler:0.1')
-    for subreddit in subreddits[subreddit_start:]:
-        for query in queries[queries_start:]:
-            print("Crawling SubReddit \"r/" + subreddit[1] + "\"("+str(subreddit[0])+") for \""+query[1]+"\"(" +
-                  str(query[0])+")")
-            count = crawl_reddit(redditApi, subreddit[1], query[1], db)
-            print("Found " + str(count) + " posts for SubReddit \"r/" + subreddit[1] + "\"("+str(subreddit[0])+") for \""+query[1]+"\"(" +
-                  str(query[0])+")")
-    return True
+def create_comment_document(comment):
+    doc = {
+        "id": comment.id,
+    }
+    if hasattr(comment, "retrieved_on"):
+        doc["retrieved_on"] = comment.retrieved_on
+    if hasattr(comment, "author") and comment.author is not None:
+        doc["author"] = comment.author.id
+    if hasattr(comment, "ups"):
+        doc["ups"] = comment.ups
+    if hasattr(comment, "downs"):
+        doc["downs"] = comment.downs,
+    if hasattr(comment, "body"):
+        doc["body"] = comment.body
+    if hasattr(comment, "name"):
+        doc["name"] = comment.name
+    if hasattr(comment, "created_utc"):
+        doc["created_utc"] = comment.created_utc
+    if hasattr(comment, "subreddit_id"):
+        doc["subreddit_id"] = comment.subreddit_id
+    if hasattr(comment, "link_id"):
+        doc["link_id"] = comment.link_id
+    if hasattr(comment, "parent_id"):
+        doc["parent_id"] = comment.parent_id
+    if hasattr(comment, "score"):
+        doc["score"] = comment.score
+    if hasattr(comment, "controversiality"):
+        doc["controversiality"] = comment.controversiality
+    if hasattr(comment, "distinguished"):
+        doc["distinguished"] = comment.distinguished
+    return doc
 
 
-def crawl_reddit(redditApi,subreddit, query, db):
-    gen = redditApi.search(query, subreddit=subreddit, sort="relevance")
-    count = 0
-    for submission in gen:
-        docs = create_documents(submission, query)
-        db["reddit_posts"].insert_many(docs)
-        count += len(docs)
-    return count
-
-
-def create_documents(submission, query):
-    insert = [create_submission_document(submission, query)]
-    submission.replace_more_comments(limit=30, threshold=1)
+def create_documents(submission):
+    print("Creating Documents")
+    print(str(submission.subreddit))
+    documents = []
+    submission.replace_more_comments(limit=None, threshold=1)
+    oauth_helper.refresh()
     comments = praw.helpers.flatten_tree(submission.comments, nested_attr=u'replies', depth_first=False)
-    title = submission.title
-    title = unicodedata.normalize('NFKD', title).encode('ascii','ignore')
-    print("Found " + str(len(comments)) + " comments for submission \"" +
-          str(title) + "\"")
     for comment in comments:
         if type(comment) is praw.objects.MoreComments:
             continue
-        insert.append(create_comment_document(comment, submission.title, query))
-    return insert
+        documents.append(create_comment_document(comment))
+    return documents
 
 
-def create_comment_document(comment, title, query):
-    doc = {"type": "comment",
-           "id": comment.id,
-           "ups": comment.ups,
-           "downs": comment.downs,
-           "body": comment.body,
-           "title": title,
-           "query": query
-           }
-    if comment.author is not None:
-        doc.update({"author": comment.author.name})
-    return doc
+def crawl_subreddit(reddit, subreddit, db):
+    print("Create Query for ")
+    query = querygen.create_cloudsearch_query({
+        "fromdate": then,
+        "untildate": today,
+        "subreddit": subreddit
+    })
+    print(query)
+    gen = reddit.search(query, syntax="cloudsearch", subreddit=subreddit, sort="relevance")
+    count = 0
+    errors = 0;
+
+    for submission in gen:
+        print("Next Submission")
+        tryagain = True
+        while tryagain:
+            try:
+                docs = create_documents(submission)
+                try:
+                    if docs:
+                        db["reddit_posts"].insert_many(docs)
+                        count += len(docs)
+                    tryagain = False
+                except BaseException as e:
+                    print("inserting in db failed - skip")
+                    print(e)
+            except praw.errors.OAuthInvalidToken:
+                # token expired, refresh 'em!
+                print("Refreshing Token")
+                oauth_helper.refresh()
+            except:
+                print("unecpected error " + sys.exc_info()[0])
+                errors += 1;
+                if errors > 100:
+                    tryagain = False;
+    return count
 
 
-def create_submission_document(submission, query):
-    doc = {"type": "submission",
-           "id": submission.id,
-           "ups": submission.ups,
-           "downs": submission.downs,
-           "author": submission.author.name,
-           "title": submission.title,
-           "body": submission.selftext,
-           "query": query
-           }
-    return doc
+def crawl_movies(reddit_client, subreddits):
+    db = mongo_connection.MongoConnection().get_db()
+    print("Starting to Crawl movies")
+    for subreddit in subreddits:
+        print("Next Subreddit")
+        try:
+            oauth_helper.refresh()
+            count = crawl_subreddit(reddit_client, subreddit, db)
+        except praw.errors.OAuthInvalidToken:
+            # token expired, refresh 'em!
+            oauth_helper.refresh()
+            print("Refreshing Token")
+    print(count)
+    return True
+
+
+crawl_movies(reddit_client, subreddits)
+
+
+
+
+
