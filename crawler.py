@@ -1,6 +1,6 @@
 import praw
 import time
-import json
+# import json
 from prawoauth2 import PrawOAuth2Mini
 
 
@@ -22,8 +22,8 @@ class Crawler:
             if hasattr(comment, "created_utc") and comment.created_utc < cutoff:
                 break
             document = Crawler.create_comment_document(comment)
-            # self.db.insert(document)
-            print(json.dumps(document))
+            self.db.insert_one(document)
+            # print(json.dumps(document))
 
     def get_comments(self, subreddit, t):
         try:
@@ -77,13 +77,13 @@ class Crawler:
 
 
 
-def init_crawler(app_key, app_secret, access_token, refresh_token):
+def init_crawler(app_key, app_secret, access_token, refresh_token, db):
     scopes = ['identity', 'read']
     subreddits = ['movies']
     user_agent = 'Movie discussion crawler as part of university project 2015 (by YoungFaa)'
     reddit = praw.Reddit(user_agent=user_agent)
     auth = PrawOAuth2Mini(reddit, app_key=app_key, app_secret=app_secret, access_token=access_token, scopes=scopes,
                           refresh_token=refresh_token)
-    crawler = Crawler(reddit, auth, subreddits, None)
+    crawler = Crawler(reddit, auth, subreddits, db)
     crawler.start()
 
